@@ -1,0 +1,70 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Mar 21 13:28:10 2025
+
+@author: u2171939
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.stats as stats
+from multiprocessing import Pool
+from tqdm import tqdm
+
+# Configuration (adjust these for feasibility)
+n_chains = 20     # Reduced from 10,000 for testing
+n_iter = 100000     # Reduced from 10,000,000 for testing
+sigma_proposal = 2.0 # Tuned proposal standard deviation
+
+# Theoretical values
+mu_true = 2/np.pi
+sigma_true = np.sqrt(3 - (2/np.pi)**2)
+
+def run_chain(args):
+    """Run a single RWM chain and return ergodic average of |X|"""
+    seed, n_iter, sigma = args
+    np.random.seed(seed)
+    x = 0.0
+    sum_abs = 0.0
+    accepts = 0
+    
+    for _ in range(n_iter):
+        x_prop = x + sigma * np.random.randn()
+        log_alpha = stats.t.logpdf(x_prop, df=3) - stats.t.logpdf(x, df=3)
+        
+        if np.log(np.random.rand()) < log_alpha:
+            x = x_prop
+            accepts += 1
+        sum_abs += np.abs(x)
+    
+    return sum_abs / n_iter, accepts / n_iter
+
+def main():
+    # Run chains in parallel
+    with Pool() as pool:
+        seeds = np.random.SeedSequence().generate_state(n_chains)
+        results = list(tqdm(pool.imap(run_chain, 
+                                     [(s, n_iter, sigma_proposal) for s in seeds]),
+                        total=n_chains))
+    
+    ergodic_avgs, accept_rates = zip(*results)
+    
+    # Normalize averages
+    normalized = (np.array(ergodic_avgs) - mu_true) / (sigma_true / np.sqrt(n_iter))
+    
+    # QQ-plot
+    plt.figure(figsize=(10, 6))
+    stats.probplot(normalized, dist="norm", plot=plt)
+    plt.title("QQ-Plot of Normalized Ergodic Averages")
+    plt.xlabel("Theoretical Normal Quantiles")
+    plt.ylabel("Sample Quantiles")
+    plt.grid(True)
+    plt.show()
+    
+    # Print diagnostics
+    print(f"Average acceptance rate: {np.mean(accept_rates):.3f}")
+    print(f"Normalized mean: {np.mean(normalized):.3f}")
+    print(f"Normalized std: {np.std(normalized):.3f}")
+
+if __name__ == "__main__":
+    main()
