@@ -1,0 +1,51 @@
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import probplot, t
+
+def rwm_sampler(target_density, proposal_std, x0, n_samples):
+    samples = np.zeros(n_samples)
+    x = x0
+    samples[0] = x
+    for i in range(1, n_samples):
+        proposal = x + t.rvs(df=0.5) * proposal_std  # Student's t-distributed proposals
+        acceptance_prob = min(1, target_density(proposal) / target_density(x))
+        if np.random.rand() < acceptance_prob:
+            x = proposal
+        samples[i] = x
+    return samples
+
+def cauchy_density(x):
+    return 1.0 / (np.pi * (1 + x**3))
+
+n_samples = 5000000
+burn_in = 50000
+proposal_std = 1.0
+x0 = 0.0
+
+start_time = time.time()
+
+samples = rwm_sampler(cauchy_density, proposal_std, x0, n_samples)
+samples = samples[burn_in:]
+
+g_vals = np.sqrt(np.abs(samples))
+g_mean = np.mean(g_vals)
+g_centered = g_vals - g_mean
+
+n_blocks = 100
+block_size = len(g_centered) // n_blocks
+block_averages = np.array([
+    np.mean(g_centered[i * block_size:(i + 1) * block_size])
+    for i in range(n_blocks)
+])
+
+end_time = time.time()
+execution_time = end_time - start_time
+print(f"Execution time: {execution_time:.2f} seconds")
+
+plt.figure(figsize=(6, 6))
+probplot(block_averages, dist="norm", plot=plt)
+plt.title("QQ Plot of Block Averages\nof g(x) = |x|^(1/2) - E[|x|^(1/2)] for RWM")
+plt.xlabel("Theoretical Quantiles")
+plt.ylabel("Sample Quantiles")
+plt.show()
