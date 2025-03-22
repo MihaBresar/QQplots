@@ -7,6 +7,11 @@
 
 using namespace std;
 
+// Define M_PI if it is not already defined
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 // Function to generate random numbers from a Cauchy distribution
 double cauchy_sample(mt19937 &gen) {
     uniform_real_distribution<double> uniform_dist(0.0, 1.0);
@@ -15,7 +20,7 @@ double cauchy_sample(mt19937 &gen) {
 
 // Target density function (Standard Cauchy)
 double cauchy_density(double x) {
-    return 1.0 / (M_PI * (1 + pow(x, 3)));
+    return 1.0 / (M_PI * (1 + pow(x, 2)));  // Fixed the power to 2 instead of 3
 }
 
 // Random Walk Metropolis (RWM) sampler
