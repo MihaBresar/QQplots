@@ -1,14 +1,14 @@
 import time
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import probplot, t
+from scipy.stats import probplot
 
 def rwm_sampler(target_density, proposal_std, x0, n_samples):
     samples = np.zeros(n_samples)
     x = x0
     samples[0] = x
     for i in range(1, n_samples):
-        proposal = x + t.rvs(df=0.5) * proposal_std  # Student's t-distributed proposals
+        proposal = x + proposal_std * np.tan(np.pi * (np.random.rand() - 0.5))  # Cauchy-distributed proposals
         acceptance_prob = min(1, target_density(proposal) / target_density(x))
         if np.random.rand() < acceptance_prob:
             x = proposal
@@ -16,7 +16,7 @@ def rwm_sampler(target_density, proposal_std, x0, n_samples):
     return samples
 
 def cauchy_density(x):
-    return 1.0 / (np.pi * (1 + x**3))
+    return 1.0 / (np.pi * (1 + x**5))
 
 n_samples = 5000000
 burn_in = 50000
