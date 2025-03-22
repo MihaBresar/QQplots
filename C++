@@ -1,0 +1,71 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <random>
+#include <chrono>
+#include <algorithm>
+
+using namespace std;
+
+// Function to generate random numbers from a Cauchy distribution
+double cauchy_sample(mt19937 &gen) {
+    uniform_real_distribution<double> uniform_dist(0.0, 1.0);
+    return tan(M_PI * (uniform_dist(gen) - 0.5));
+}
+
+// Target density function (Standard Cauchy)
+double cauchy_density(double x) {
+    return 1.0 / (M_PI * (1 + pow(x, 3)));
+}
+
+// Random Walk Metropolis (RWM) sampler
+vector<double> rwm_sampler(int n_samples, double proposal_std, double x0) {
+    vector<double> samples(n_samples);
+    mt19937 gen(random_device{}());
+    uniform_real_distribution<double> uniform_dist(0.0, 1.0);
+    
+    double x = x0;
+    samples[0] = x;
+    
+    for (int i = 1; i < n_samples; ++i) {
+        double proposal = x + proposal_std * cauchy_sample(gen);
+        double acceptance_prob = min(1.0, cauchy_density(proposal) / cauchy_density(x));
+        
+        if (uniform_dist(gen) < acceptance_prob) {
+            x = proposal;
+        }
+        samples[i] = x;
+    }
+    
+    return samples;
+}
+
+int main() {
+    int n_samples = 5000000;
+    int burn_in = 50000;
+    double proposal_std = 1.0;
+    double x0 = 0.0;
+    int n_paths = 100;
+    
+    auto start = chrono::high_resolution_clock::now();
+    
+    vector<double> ergodic_averages(n_paths);
+    
+    for (int i = 0; i < n_paths; ++i) {
+        vector<double> samples = rwm_sampler(n_samples, proposal_std, x0);
+        samples.erase(samples.begin(), samples.begin() + burn_in);
+        
+        double sum = 0.0;
+        for (double s : samples) {
+            sum += sqrt(abs(s));
+        }
+        ergodic_averages[i] = sum / samples.size();
+    }
+    
+    auto end = chrono::high_resolution_clock::now();
+    chrono::duration<double> execution_time = end - start;
+    
+    cout << "Execution time: " << execution_time.count() << " seconds" << endl;
+    
+    return 0;
+}
