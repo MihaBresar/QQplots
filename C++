@@ -52,20 +52,20 @@ int main() {
     auto start = chrono::high_resolution_clock::now();
     
     vector<double> ergodic_averages(n_paths);
-    vector<double> all_samples; // Declare all_samples here
+    vector<double> all_samples; // DECLARATION OF all_samples HERE
     
     for (int i = 0; i < n_paths; ++i) {
         vector<double> samples = rwm_sampler(n_samples, proposal_std, x0);
         samples.erase(samples.begin(), samples.begin() + burn_in);
         
         double sum = 0.0;
-        for (double s : samples) { // Fix: No semicolon after loop
+        for (double s : samples) {
             sum += sqrt(abs(s));
-        } // Closing brace (no semicolon here)
+        }
         ergodic_averages[i] = sum / samples.size();
         
-        // Append samples to all_samples
-        all_samples.insert(all_samples.end(), samples.begin(), samples.end()); // Fix: Added semicolon
+        // Append to all_samples
+        all_samples.insert(all_samples.end(), samples.begin(), samples.end()); 
     }
     
     auto end = chrono::high_resolution_clock::now();
