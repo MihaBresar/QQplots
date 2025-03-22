@@ -4,6 +4,7 @@
 #include <random>
 #include <chrono>
 #include <algorithm>
+#include <fstream> // Include for file handling
 
 using namespace std;
 
@@ -55,6 +56,7 @@ int main() {
     auto start = chrono::high_resolution_clock::now();
     
     vector<double> ergodic_averages(n_paths);
+    vector<double> all_samples; // To store all samples for saving to file
     
     for (int i = 0; i < n_paths; ++i) {
         vector<double> samples = rwm_sampler(n_samples, proposal_std, x0);
@@ -65,12 +67,24 @@ int main() {
             sum += sqrt(abs(s));
         }
         ergodic_averages[i] = sum / samples.size();
+        
+        // Append samples to all_samples
+        all_samples.insert(all_samples.end(), samples.begin(), samples.end());
     }
     
     auto end = chrono::high_resolution_clock::now();
     chrono::duration<double> execution_time = end - start;
     
     cout << "Execution time: " << execution_time.count() << " seconds" << endl;
+    
+    // Save all samples to a file
+    ofstream outfile("samples.txt");
+    for (double s : all_samples) {
+        outfile << s << endl;
+    }
+    outfile.close();
+    
+    cout << "Samples saved to 'samples.txt'" << endl;
     
     return 0;
 }
