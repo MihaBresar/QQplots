@@ -52,7 +52,7 @@ int main() {
     auto start = chrono::high_resolution_clock::now();
     
     vector<double> ergodic_averages(n_paths);
-    vector<double> all_samples; // DECLARATION OF all_samples HERE
+    vector<double> all_samples; // Declare all_samples here
     
     for (int i = 0; i < n_paths; ++i) {
         vector<double> samples = rwm_sampler(n_samples, proposal_std, x0);
@@ -64,7 +64,7 @@ int main() {
         }
         ergodic_averages[i] = sum / samples.size();
         
-        // Append to all_samples
+        // Append samples to all_samples
         all_samples.insert(all_samples.end(), samples.begin(), samples.end()); 
     }
     
@@ -73,8 +73,19 @@ int main() {
     
     cout << "Execution time: " << execution_time.count() << " seconds" << endl;
     
+    // Print the last 5 samples
+    cout << "Last 5 samples:" << endl;
+    for (size_t i = all_samples.size() - 5; i < all_samples.size(); ++i) {
+        cout << all_samples[i] << endl;
+    }
+    
     // Save to file
     ofstream outfile("samples.txt");
+    if (!outfile) {
+        cerr << "Error: Unable to open file 'samples.txt' for writing." << endl;
+        return 1; // Exit with error code
+    }
+    
     for (double s : all_samples) {
         outfile << s << endl;
     }
