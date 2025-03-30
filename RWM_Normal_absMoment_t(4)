@@ -1,0 +1,128 @@
+#include <iostream>
+#include <vector>
+#include <random>
+#include <chrono>
+#include <fstream>
+#include <cmath>
+#include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// Optimized unnormalized PDF calculation using direct multiplication
+inline double unnormalized_t4_like_pdf(double x) {
+    double tmp = 1.0 + (x * x) / 4.0;
+    return 1.0 / (tmp * tmp);
+}
+
+// Random Walk Metropolis with Normal proposals and on-the-fly ergodic sum calculation.
+// Note: We no longer track the acceptance rate.
+std::vector<double> rwm_t4_like_normal(
+    int n_iter,
+    double initial,
+    double proposal_scale,
+    std::mt19937& rng,
+    int burnin,
+    double& ergodic_sum_out
+) {
+    std::vector<double> chain(n_iter);
+    chain[0] = initial;
+    double p_current = unnormalized_t4_like_pdf(chain[0]);
+
+    // Normal proposal distribution and uniform distribution for acceptance decision.
+    std::normal_distribution<double> normal_dist(0.0, 1.0);
+    std::uniform_real_distribution<double> uniform_dist(0.0, 1.0);
+
+    ergodic_sum_out = 0.0;
+
+    for (int i = 1; i < n_iter; i++) {
+        double step = normal_dist(rng) * proposal_scale;
+        double x_prop = chain[i - 1] + step;
+        double p_prop = unnormalized_t4_like_pdf(x_prop);
+
+        // Metropolis acceptance ratio (symmetric proposal)
+        double alpha = p_prop / p_current;
+
+        // Accept or reject the proposal
+        if (uniform_dist(rng) < alpha) {
+            chain[i] = x_prop;
+            p_current = p_prop;
+        } else {
+            chain[i] = chain[i - 1];
+        }
+
+        // Accumulate ergodic sum for |x| after burn-in
+        if (i >= burnin)
+            ergodic_sum_out += std::fabs(chain[i]);
+    }
+
+    return chain;
+}
+
+int main() {
+    using clock_type = std::chrono::high_resolution_clock;
+
+    // Simulation parameters
+    const int N = 500000;          // Total samples per chain
+    const int burnin = 100000;       // Burn-in period
+    const int n_simulations = 10000; // Number of independent chains
+    const double proposal_scale = 5; // Scale parameter for the Normal proposal
+
+    std::vector<double> ergodic_averages(n_simulations);
+    std::vector<double> last5_samples_chain_1(5, 0.0);
+
+    auto start_time = clock_type::now();
+
+    // Parallel simulation of chains using OpenMP.
+    #pragma omp parallel
+    {
+        // Each thread gets its own RNG seeded independently.
+        std::random_device rd;
+        std::mt19937 rng(rd());
+
+        #pragma omp for
+        for (int i = 0; i < n_simulations; i++) {
+            double ergodic_sum = 0.0;
+            std::vector<double> chain = rwm_t4_like_normal(N, 0.0, proposal_scale, rng, burnin, ergodic_sum);
+
+            // Compute ergodic average for the chain (after burn-in)
+            ergodic_averages[i] = ergodic_sum / static_cast<double>(N - burnin);
+
+            // Save the last 5 samples of the first chain for demonstration
+            if (i == 0) {
+                for (int j = 0; j < 5; j++) {
+                    last5_samples_chain_1[j] = chain[N - 5 + j];
+                }
+            }
+        }
+    }
+
+    auto end_time = clock_type::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+
+    // Print results
+    std::cout << "Last 5 samples of the first RWM chain:\n";
+    for (double val : last5_samples_chain_1) {
+        std::cout << val << " ";
+    }
+    std::cout << "\nLast 5 ergodic averages:\n";
+    for (int i = n_simulations - 5; i < n_simulations; i++) {
+        std::cout << ergodic_averages[i] << " ";
+    }
+    std::cout << "\nTotal elapsed time: " << elapsed.count() << " seconds.\n";
+
+    // Save ergodic averages to file for future plotting
+    std::ofstream outfile("ergodic_averages.csv");
+    if (outfile.is_open()) {
+        outfile << "ergodic_average\n";
+        for (double avg : ergodic_averages) {
+            outfile << avg << "\n";
+        }
+        outfile.close();
+        std::cout << "Ergodic averages saved to ergodic_averages.csv\n";
+    } else {
+        std::cerr << "Could not open ergodic_averages.csv for writing!\n";
+    }
+
+    return 0;
+}
