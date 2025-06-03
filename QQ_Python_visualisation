@@ -1,0 +1,10 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.stats as stats
+
+data = np.loadtxt("ergodic_average_abs_v=1.csv", skiprows=0)  # skip header line
+stats.probplot(data, dist="norm", plot=plt)
+plt.title("QQ Plot of Ergodic Averages of tail probabilities (Cauchy Proposals with v=5)")
+plt.xlabel("Theoretical Quantiles")
+plt.ylabel("Sample Quantiles")
+plt.show()
