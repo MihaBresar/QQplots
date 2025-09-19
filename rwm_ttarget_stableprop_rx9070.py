@@ -12,9 +12,9 @@ import pyopencl.array as cl_array
 os.environ["PYOPENCL_NO_CACHE"] = "1"
 
 # ================== TUNABLES ==================
-N_TOTAL           =  20_000_000     # steps per chain
-BURNIN            =  10_000_000
-N_CHAINS          =     150_000     # raise to 100k–300k to feed the GPU
+N_TOTAL           =  2_000_000     # steps per chain
+BURNIN            =    500_000
+N_CHAINS          =     50_000     # raise to 100k–300k to feed the GPU
 
 # Target: Student-t with nu_target > 3 (we use 5) and scale tau
 NU_TARGET         =        5.0
@@ -250,4 +250,27 @@ def run():
     props = int(prop_count.get()[0])
     acc_rate = (acc / props) if props > 0 else float('nan')
 
-    print(f"\nEla
+    print(f"\nElapsed: {elapsed:.2f}s | Chains: {n:,} | Steps/chain: {N_TOTAL:,}")
+    print("Last 5 ergodic |x| averages:", erg_abs[-5:])
+    print("Last 5 ergodic indicators :", erg_ind[-5:])
+    print(f"Chain 0 acceptance: {acc} / {props} = {acc_rate:.4f}")
+
+    # Save CSVs next to this script
+    scriptdir = os.path.dirname(os.path.abspath(__file__))
+
+    with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_ttarget_stable.csv"), "w", newline="") as f:
+        w = csv.writer(f); w.writerows([[v] for v in erg_abs])
+
+    with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_ttarget_stable.csv"), "w", newline="") as f:
+        w = csv.writer(f); w.writerows([[v] for v in erg_ind])
+
+    with open(os.path.join(scriptdir, "acceptance_chain0_RWM_ttarget_stable.txt"), "w") as f:
+        f.write(f"accepts={acc}, proposals={props}, accept_rate={acc_rate:.6f}\n")
+
+    print("\nCSV files written:")
+    print("  ergodic_average_abs_RWM_ttarget_stable.csv")
+    print("  ergodic_average_indicator_RWM_ttarget_stable.csv")
+    print("  acceptance_chain0_RWM_ttarget_stable.txt")
+
+if __name__ == "__main__":
+    run()
