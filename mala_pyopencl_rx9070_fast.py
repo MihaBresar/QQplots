@@ -4,10 +4,10 @@
 import time, numpy as np
 import pyopencl as cl
 import pyopencl.array as cl_array
-
+import csv, os
 # ======== TUNABLES ========
 N_TOTAL          = 30_000_000   # steps per chain
-BURNIN           = 100
+BURNIN           = 10_000_000
 N_CHAINS         = 200_000      # try 100k–300k for better utilization
 STEP_SIZE        = 0.55
 STEPS_PER_LAUNCH = 6000         # inner-iter does 2 steps -> 12k steps/launch
@@ -188,6 +188,21 @@ def run():
     print(f"\nElapsed: {elapsed:.2f}s | Chains: {n:,} | Steps/chain: {N_TOTAL:,}")
     print("Last 5 ergodic |x| averages:", erg_abs[-5:])
     print("Last 5 ergodic indicators :", erg_ind[-5:])
+    scriptdir = os.path.dirname(os.path.abspath(__file__))
+
+with open(os.path.join(scriptdir, "ergodic_average_abs_MALA.csv"), "w", newline="") as f:
+    writer = csv.writer(f)
+    for val in erg_abs:
+        writer.writerow([val])
+
+with open(os.path.join(scriptdir, "ergodic_average_indicator_MALA.csv"), "w", newline="") as f:
+    writer = csv.writer(f)
+    for val in erg_ind:
+        writer.writerow([val])
+
+print("\nCSV files written:")
+print("  ergodic_average_abs_MALA.csv")
+print("  ergodic_average_indicator_MALA.csv")
 
 if __name__ == "__main__":
     run()
