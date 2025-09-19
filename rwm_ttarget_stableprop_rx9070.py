@@ -1,35 +1,36 @@
-# rwm_ttarget_stableprop_rx9070.py
-# Random-Walk Metropolis targeting Student-t(ν_target=5) (finite 3 moments),
-# proposals from symmetric alpha-stable (alpha=0.1) via CMS method.
-# OpenCL on AMD RX 9070 (gfx1201). Writes CSVs and acceptance for chain 0.
+# rwm_ttarget_stableprop_rx9070_ascii.py
+# RWM targeting Student-t (nu_target=5, finite first three moments).
+# Proposals from symmetric alpha-stable (alpha=0.1) using CMS method.
+# OpenCL on AMD RX 9070. ASCII-only kernel; cache disabled to avoid Unicode issues.
+# Writes ergodic averages to CSV and acceptance for chain 0 to a text file.
 
 import os, time, csv, numpy as np
 import pyopencl as cl
 import pyopencl.array as cl_array
 
+# Disable PyOpenCL kernel caching to avoid Unicode encoding problems on Windows
+os.environ["PYOPENCL_NO_CACHE"] = "1"
+
 # ================== TUNABLES ==================
-N_TOTAL           =  2_000_000     # steps per chain (raise as needed)
-BURNIN            =    500_000
-N_CHAINS          =     50_000     # increase (100k–300k) to boost GPU utilization
+N_TOTAL           =  20_000_000     # steps per chain
+BURNIN            =  10_000_000
+N_CHAINS          =     150_000     # raise to 100k–300k to feed the GPU
 
 # Target: Student-t with nu_target > 3 (we use 5) and scale tau
 NU_TARGET         =        5.0
-TAU_TARGET        =        1.0      # scale of the target (like standard t when =1)
+TAU_TARGET        =        1.0
 
-# Proposal: symmetric alpha-stable (very heavy-tailed) via CMS
-PROPOSAL_ALPHA    =        0.10     # alpha in (0,2]; 0.1 is ultra heavy-tailed
-PROPOSAL_SCALE    =        1.0      # overall proposal step scale (tune this)
+# Proposal: symmetric alpha-stable via CMS
+PROPOSAL_ALPHA    =        0.10     # 0.1 is ultra heavy-tailed
+PROPOSAL_SCALE    =        1.0      # step size multiplier
 
-STEPS_PER_LAUNCH  =      4000       # inner-iter does 2 steps => 8000 steps per launch
-DESIRED_LOCAL     =       256       # 128/256/512; auto-clamped to valid
+STEPS_PER_LAUNCH  =      4000       # inner-iter does 2 steps => 8000 steps/launch
+DESIRED_LOCAL     =       256       # 128/256/512; auto-clamped
 SEED              = 123456789
 
 # Lock to RX 9070 based on your listing: Platform 0, Device 1
 PLATFORM_INDEX    =         0
 DEVICE_INDEX      =         1
-
-# Optional: disable PyOpenCL kernel caching if your system still warns
-# os.environ["PYOPENCL_NO_CACHE"] = "1"
 
 # ================== KERNEL (ASCII ONLY) ==================
 KERNEL = r"""
@@ -43,53 +44,50 @@ inline float u01(uint *s){
     return fmax((x + 1u) * 2.3283064365386963e-10f, 1.0e-7f);
 }
 
-// Symmetric alpha-stable sample (beta=0) via Chambers-Mallows-Stuck.
+// Symmetric alpha-stable sample (beta=0) via Chambers-Mallows-Stuck (CMS).
 // U ~ Uniform(-pi/2, pi/2), W ~ Exp(1).
-// For beta=0, formula simplifies to:
-// X = [ sin(alpha*U) / (cos U)^(1/alpha) ] * [ cos( (1-alpha)*U ) / W ]^((1-alpha)/alpha)
-// To avoid overflow/NaN, clamp cos(...) and W away from 0, and compute via logs.
+// For beta=0, we use a numerically stable log-exp composition and clamp cosines and W away from 0.
 inline float sample_symmetric_stable(uint *state, float alpha){
-    // Map u in (0,1] to U in (-pi/2, pi/2)
-    float u = u01(state);
-    // avoid endpoints that make cos(U)=0
     const float pi = 3.14159265358979323846f;
-    float U = pi*(u - 0.5f);                 // (-pi/2, pi/2)
 
-    // Exponential(1): W = -log(u2), clamp away from 0
+    // U in (-pi/2, pi/2)
+    float u = u01(state);
+    float U = pi*(u - 0.5f);
+
+    // W ~ Exp(1)
     float u2 = u01(state);
     float W  = -native_log(u2);
     W = fmax(W, 1e-12f);
 
-    float cU   = native_cos(U);
-    float sA   = native_sin(alpha*U);
-    float cA   = native_cos((1.0f - alpha)*U);
+    float cU = native_cos(U);
+    float sA = native_sin(alpha*U);
+    float cA = native_cos((1.0f - alpha)*U);
 
-    // clamp cosines to avoid division by 0
+    // clamp cosines
     cU = fmax(cU, 1e-12f);
     cA = fmax(cA, 1e-12f);
 
     float inv_alpha = 1.0f / alpha;
     float one_minus_over_alpha = (1.0f - alpha) * inv_alpha;
 
-    // term1 = sin(alpha*U) / (cos U)^(1/alpha)
+    // term1 = sin(alpha*U) / (cos U)^(1/alpha)  = sA * exp( - (1/alpha) * log(cU) )
     float term1 = sA * native_exp( -inv_alpha * native_log(cU) );
 
-    // term2 = [ cA / W ]^((1-alpha)/alpha) = exp( ((1-alpha)/alpha) * (log(cA) - log(W)) )
+    // term2 = [ cA / W ]^((1-alpha)/alpha) = exp( ((1-alpha)/alpha) * ( log(cA) - log(W) ) )
     float term2 = native_exp( one_minus_over_alpha * ( native_log(cA) - native_log(W) ) );
 
     return term1 * term2;
 }
 
-// Student-t target (unnormalised) with nu_target and scale tau:
-// p(x) ∝ [ 1 + (x/tau)^2 / nu ]^{-(nu+1)/2}
-// We use log form for stability.
+// Student-t target (unnormalised) with parameters (nu, tau):
+// log p(x) = -0.5 * (nu + 1) * log( 1 + (x/tau)^2 / nu )
 inline float log_unnorm_t_target(float x, float nu, float tau){
     float z  = x / tau;
     float q  = 1.0f + (z*z) / nu;
     return -0.5f * (nu + 1.0f) * native_log(q);
 }
 
-// Two RWM steps per inner loop (reduces launch overhead).
+// Two RWM steps per inner loop to reduce launch overhead.
 __kernel void rwm_stable_chunk2(
     __global float  *x, __global double *sum_abs, __global double *sum_ind,
     __global int    *burn_left, __global uint   *rng_state,
@@ -103,14 +101,13 @@ __kernel void rwm_stable_chunk2(
     int i = get_global_id(0);
     if (i >= n) return;
 
-    // Initialize state
     float xi = x[i];
     float lp_current = log_unnorm_t_target(xi, nu_target, tau_target);
 
     int   b  = burn_left[i];
     uint  s  = rng_state[i];
 
-    // Local acceptance counters for chain 0 only
+    // local acceptance counters for chain 0 only
     uint acc0 = 0, prop0 = 0;
 
     for (int it=0; it<K; ++it){
@@ -118,7 +115,6 @@ __kernel void rwm_stable_chunk2(
         float step = prop_scale * sample_symmetric_stable(&s, alpha);
         float xprop = xi + step;
         float lp_prop = log_unnorm_t_target(xprop, nu_target, tau_target);
-
         float loga = lp_prop - lp_current;   // symmetric proposal
         float u = u01(&s);
         if (native_log(u) < loga){ xi = xprop; lp_current = lp_prop; if (i==0) acc0++; }
@@ -133,7 +129,6 @@ __kernel void rwm_stable_chunk2(
         step  = prop_scale * sample_symmetric_stable(&s, alpha);
         xprop = xi + step;
         lp_prop = log_unnorm_t_target(xprop, nu_target, tau_target);
-
         loga = lp_prop - lp_current;
         u    = u01(&s);
         if (native_log(u) < loga){ xi = xprop; lp_current = lp_prop; if (i==0) acc0++; }
@@ -188,7 +183,6 @@ def round_up(x, m):
 
 # ================== RUN ==================
 def run():
-    # RX 9070 (P0:D1)
     plats = cl.get_platforms()
     dev = plats[PLATFORM_INDEX].get_devices()[DEVICE_INDEX]
     ctx = cl.Context([dev])
@@ -199,6 +193,7 @@ def run():
     kernel = cl.Kernel(prg, "rwm_stable_chunk2")
 
     n = int(N_CHAINS)
+
     # Device buffers
     x = cl_array.zeros(queue, n, dtype=np.float32)
     sum_abs = cl_array.zeros(queue, n, dtype=np.float64)
@@ -223,7 +218,7 @@ def run():
     kernel.set_arg(9,  np.float32(PROPOSAL_SCALE))
     kernel.set_arg(10, np.float32(NU_TARGET))
     kernel.set_arg(11, np.float32(TAU_TARGET))
-    # arg 12 = K, set per launch
+    # arg 12 (K) set per launch
 
     # Launch geometry
     local_size = choose_local_size(dev, kernel, DESIRED_LOCAL)
@@ -255,27 +250,4 @@ def run():
     props = int(prop_count.get()[0])
     acc_rate = (acc / props) if props > 0 else float('nan')
 
-    print(f"\nElapsed: {elapsed:.2f}s | Chains: {n:,} | Steps/chain: {N_TOTAL:,}")
-    print("Last 5 ergodic |x| averages:", erg_abs[-5:])
-    print("Last 5 ergodic indicators :", erg_ind[-5:])
-    print(f"Chain 0 acceptance: {acc} / {props} = {acc_rate:.4f}")
-
-    # Save CSVs next to this script
-    scriptdir = os.path.dirname(os.path.abspath(__file__))
-
-    with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_ttarget_stable.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerows([[v] for v in erg_abs])
-
-    with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_ttarget_stable.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerows([[v] for v in erg_ind])
-
-    with open(os.path.join(scriptdir, "acceptance_chain0_RWM_ttarget_stable.txt"), "w") as f:
-        f.write(f"accepts={acc}, proposals={props}, accept_rate={acc_rate:.6f}\n")
-
-    print("\nCSV files written:")
-    print("  ergodic_average_abs_RWM_ttarget_stable.csv")
-    print("  ergodic_average_indicator_RWM_ttarget_stable.csv")
-    print("  acceptance_chain0_RWM_ttarget_stable.txt")
-
-if __name__ == "__main__":
-    run()
+    print(f"\nEla
