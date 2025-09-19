@@ -59,3 +59,135 @@ __kernel void mala_chunk2(
     uint  s  = rng_state[i];
 
     for (int it=0; it<K; ++it){
+        float z0, z1; randn_pair(&s, &z0, &z1);
+
+        // ---- step A ----
+        float g  = grad_log_unnorm_t4(xx);
+        float mf = xx + 0.5f*ss2*g;
+        float xprop = mf + step*z0;
+        float lp_prop = log_unnorm_t4(xprop);
+        float gp = grad_log_unnorm_t4(xprop);
+        float mb = xprop + 0.5f*ss2*gp;
+        float df = xprop - mf, db = xx - mb;
+        float loga = lp_prop - lp - inv2s*(df*df - db*db);
+        if (log(u01(&s)) < loga){ xx = xprop; lp = lp_prop; }
+        if (b > 0) --b; else {
+            double ax = (double)fabs(xx);
+            sum_abs[i] += ax; sum_ind[i] += (ax >= 2.0);
+        }
+
+        // ---- step B ----
+        g  = grad_log_unnorm_t4(xx);
+        mf = xx + 0.5f*ss2*g;
+        xprop = mf + step*z1;
+        lp_prop = log_unnorm_t4(xprop);
+        gp = grad_log_unnorm_t4(xprop);
+        mb = xprop + 0.5f*ss2*gp;
+        df = xprop - mf; db = xx - mb;
+        loga = lp_prop - lp - inv2s*(df*df - db*db);
+        if (log(u01(&s)) < loga){ xx = xprop; lp = lp_prop; }
+        if (b > 0) --b; else {
+            double ax = (double)fabs(xx);
+            sum_abs[i] += ax; sum_ind[i] += (ax >= 2.0);
+        }
+    }
+    x[i]=xx; logp[i]=lp; burn_left[i]=b; rng_state[i]=s;
+}
+"""
+
+# ======== UTIL ========
+def build_program(ctx):
+    return cl.Program(ctx, KERNEL).build(options=[
+        "-cl-fast-relaxed-math", "-cl-mad-enable", "-cl-no-signed-zeros"
+    ])
+
+def splitmix64_seed_array(n, seed):
+    """SplitMix64 in pure Python ints (no NumPy overflow warnings)."""
+    out = np.empty(n, dtype=np.uint32)
+    mask = (1 << 64) - 1
+    x = int(seed) & mask
+    for i in range(n):
+        x = (x + 0x9E3779B97F4A7C15) & mask
+        z = x
+        z ^= (z >> 30); z = (z * 0xBF58476D1CE4E5B9) & mask
+        z ^= (z >> 27); z = (z * 0x94D049BB133111EB) & mask
+        z ^= (z >> 31)
+        out[i] = np.uint32(z & 0xFFFFFFFF)
+    return out
+
+def choose_local_size(dev, kernel, desired):
+    # Clamp to device + kernel limits and align to preferred multiple
+    dev_max = dev.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
+    ker_max = kernel.get_work_group_info(cl.kernel_work_group_info.WORK_GROUP_SIZE, dev)
+    pref    = kernel.get_work_group_info(cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE, dev)
+    lsz = int(min(desired, dev_max, ker_max))
+    if pref and lsz >= pref:
+        lsz = (lsz // pref) * pref
+    lsz = max(1, lsz)
+    return lsz, pref
+
+def round_up(x, m):
+    return ((x + m - 1) // m) * m
+
+# ======== RUN (single device RX 9070) ========
+def run():
+    plats = cl.get_platforms()
+    dev = plats[PLATFORM_INDEX].get_devices()[DEVICE_INDEX]
+    ctx = cl.Context([dev])
+    queue = cl.CommandQueue(ctx)
+    print("Using device:", dev.platform.name, "|", dev.name)
+
+    prg = build_program(ctx)
+    kernel = cl.Kernel(prg, "mala_chunk2")
+
+    n = int(N_CHAINS)
+    x = cl_array.zeros(queue, n, dtype=np.float32)
+    logp = cl_array.zeros(queue, n, dtype=np.float32)  # log p(0)=0
+    sum_abs = cl_array.zeros(queue, n, dtype=np.float64)
+    sum_ind = cl_array.zeros(queue, n, dtype=np.float64)
+    burn_left = cl_array.to_device(queue, np.full(n, BURNIN, dtype=np.int32))
+    rng_state = cl_array.to_device(queue, splitmix64_seed_array(n, SEED))
+
+    ss2 = np.float32(STEP_SIZE*STEP_SIZE)
+    inv2s = np.float32(1.0/(2.0*ss2))
+
+    # Set static args once; note 'n' is arg #6 now
+    kernel.set_arg(0,  x.data)        ; kernel.set_arg(1,  logp.data)
+    kernel.set_arg(2,  sum_abs.data)  ; kernel.set_arg(3,  sum_ind.data)
+    kernel.set_arg(4,  burn_left.data); kernel.set_arg(5,  rng_state.data)
+    kernel.set_arg(6,  np.int32(n))
+    kernel.set_arg(7,  np.float32(STEP_SIZE))
+    kernel.set_arg(8,  ss2)
+    kernel.set_arg(9,  inv2s)
+    # arg 10 (K) will be set in the loop
+
+    # Choose a safe local size and pad global size
+    local_size, pref = choose_local_size(dev, kernel, DESIRED_LOCAL)
+    gsize = round_up(n, local_size)
+    global_size = (gsize,)
+    local_size  = (local_size,)
+
+    # Warmup (K=1)
+    kernel.set_arg(10, np.int32(1))
+    cl.enqueue_nd_range_kernel(queue, kernel, global_size, local_size).wait()
+
+    steps_done = 0
+    t0 = time.time()
+    while steps_done < (N_TOTAL - 1):
+        # Each inner-iter does 2 steps -> advance 2*K per launch
+        K = min(STEPS_PER_LAUNCH, ((N_TOTAL - 1) - steps_done + 1)//2)
+        kernel.set_arg(10, np.int32(K))
+        cl.enqueue_nd_range_kernel(queue, kernel, global_size, local_size).wait()
+        steps_done += 2*K
+
+    elapsed = time.time() - t0
+    kept = max(0, (N_TOTAL - 1) - BURNIN)
+    erg_abs = (sum_abs.get()/max(kept,1))
+    erg_ind = (sum_ind.get()/max(kept,1))
+
+    print(f"\nElapsed: {elapsed:.2f}s | Chains: {n:,} | Steps/chain: {N_TOTAL:,}")
+    print("Last 5 ergodic |x| averages:", erg_abs[-5:])
+    print("Last 5 ergodic indicators :", erg_ind[-5:])
+
+if __name__ == "__main__":
+    run()
