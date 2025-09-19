@@ -1,56 +1,53 @@
-# rwm_heavytail_rx9070_save.py
+# rwm_heavytail_rx9070_save_ascii.py
 # Random-Walk Metropolis with symmetric double-Pareto (mirrored Lomax) proposals
-# on AMD RX 9070 (gfx1201) via OpenCL. Saves CSVs and reports acceptance
-# probability for chain 0.
+# on AMD RX 9070 (gfx1201) via OpenCL. ASCII-only kernel (avoids Unicode cache issues).
+# Saves CSVs and chain-0 acceptance.
 
-import time, os, csv, numpy as np
+import os, time, csv, numpy as np
 import pyopencl as cl
 import pyopencl.array as cl_array
 
+# Optional: disable PyOpenCL kernel caching if you like
+# os.environ["PYOPENCL_NO_CACHE"] = "1"
+
 # ================== TUNABLES ==================
-N_TOTAL           =  2_000_000    # steps per chain (raise to 30_000_000 for big runs)
-BURNIN            =    500_000
-N_CHAINS          =     50_000    # increase (100k–300k) to feed the GPU
-PROPOSAL_SCALE    =        5.0     # proposal scale 's' (like your Julia code)
-ALPHA_TAIL        =        0.10    # tail exponent α; set 0.05 to match t(0.05) tails
+N_TOTAL           =  20_000_000    # steps per chain (raise to 30_000_000 for big runs)
+BURNIN            =  10_000_000
+N_CHAINS          =    75_000    # increase (100k–300k) to feed the GPU
+PROPOSAL_SCALE    =        5.0     # proposal scale 's'
+ALPHA_TAIL        =        0.10    # tail exponent alpha; set 0.05 to match t(0.05) tails
 
 STEPS_PER_LAUNCH  =      4000     # inner-iter does 2 steps => 8000 steps per launch
 DESIRED_LOCAL     =       256     # 128/256/512; auto-clamped safely
 SEED              = 123456789
 
-# Lock to your RX 9070 based on your listing: Platform 0, Device 1
+# Lock to your RX 9070: Platform 0, Device 1
 PLATFORM_INDEX    =         0
 DEVICE_INDEX      =         1
 
-# ================== KERNEL ==================
-# - Symmetric double-Pareto (mirrored Lomax) proposal:
-#     U1,U2 ~ Uniform(0,1], sign = ±1 (from U1), magnitude = s*(U2^{-1/α}-1)
-#   => proposal is symmetric => Hastings ratio = target ratio.
-# - Two RWM steps per inner loop (reduces launch overhead).
+# ================== KERNEL (ASCII ONLY) ==================
 KERNEL = r"""
-// We keep fp64 for accumulators (safer for very long runs).
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
 inline uint xorshift32(uint x){ x^=x<<13; x^=x>>17; x^=x<<5; return x; }
 
 inline float u01(uint *s){
     uint x = xorshift32(*s); *s = x;
-    // (x+1)*2^-32 in (≈0,1], avoid 0 precisely
+    // (x+1)*2^-32 in (0,1], avoid exact 0
     return fmax((x + 1u) * 2.3283064365386963e-10f, 1.0e-7f);
 }
 
-// Heavy-tailed symmetric step ~ double-Pareto with tail exponent (1+alpha)
-// magnitude = scale*(U^{-1/alpha}-1), sign = ±1
+// Heavy-tailed symmetric step ~ double-Pareto (mirrored Lomax) with tail exponent (1+alpha).
+// magnitude = scale*(U^(-1/alpha) - 1), sign = +/- 1
 inline float heavy_step(uint *state, float scale, float alpha){
     float u1 = u01(state);
     float sign = (u1 < 0.5f) ? -1.0f : 1.0f;
     float u  = u01(state);                   // (0,1]
-    // u^{-1/alpha} = exp( (-1/alpha) * log(u) )
     float mag = scale * (native_exp((-1.0f/alpha) * native_log(u)) - 1.0f);
     return sign * mag;
 }
 
-// Target (unnormalised): 1 / (1 + |x|^{4.5} / 9.0)
+// Target (unnormalised): 1 / (1 + |x|^4.5 / 9.0)
 inline float unnorm_target(float x){
     float ax = fabs(x);
     // pow(ax,4.5) = ax^4 * sqrt(ax)
@@ -60,6 +57,7 @@ inline float unnorm_target(float x){
     return 1.0f / (1.0f + (x45 * (1.0f/9.0f)));
 }
 
+// Two RWM steps per inner loop (reduces launch overhead).
 __kernel void rwm_heavy_chunk2(
     __global float  *x, __global double *sum_abs, __global double *sum_ind,
     __global int    *burn_left, __global uint   *rng_state,
@@ -76,7 +74,7 @@ __kernel void rwm_heavy_chunk2(
     int   b  = burn_left[i];
     uint  s  = rng_state[i];
 
-    // Local acceptance counters for chain 0
+    // Local acceptance counters for chain 0 only
     uint acc0 = 0, prop0 = 0;
 
     for (int it=0; it<K; ++it){
@@ -86,7 +84,6 @@ __kernel void rwm_heavy_chunk2(
         float pprop = unnorm_target(xprop);
         float a = pprop / p_current;                 // symmetric proposal
         float u = u01(&s);
-        // accept?
         if (u < fmin(a, 1.0f)){ xi = xprop; p_current = pprop; if (i==0) acc0++; }
         if (i==0) prop0++;
         if (b > 0) --b; else {
@@ -127,7 +124,7 @@ def build_program(ctx):
     ])
 
 def splitmix64_seed_array(n, seed):
-    """SplitMix64 in pure Python ints (no NumPy overflow warnings)."""
+    """SplitMix64 in pure Python ints (ASCII-safe, no NumPy overflow warnings)."""
     out = np.empty(n, dtype=np.uint32)
     mask = (1 << 64) - 1
     x = int(seed) & mask
@@ -226,18 +223,14 @@ def run():
     print("Last 5 ergodic indicators :", erg_ind[-5:])
     print(f"Chain 0 acceptance: {acc} / {props} = {acc_rate:.4f}")
 
-    # ========== CSV OUTPUT ==========
+    # Save CSVs next to this script
     scriptdir = os.path.dirname(os.path.abspath(__file__))
 
     with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_heavy.csv"), "w", newline="") as f:
-        w = csv.writer(f)
-        for val in erg_abs:
-            w.writerow([val])
+        w = csv.writer(f); w.writerows([[v] for v in erg_abs])
 
     with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_heavy.csv"), "w", newline="") as f:
-        w = csv.writer(f)
-        for val in erg_ind:
-            w.writerow([val])
+        w = csv.writer(f); w.writerows([[v] for v in erg_ind])
 
     with open(os.path.join(scriptdir, "acceptance_chain0_RWM_heavy.txt"), "w") as f:
         f.write(f"accepts={acc}, proposals={props}, accept_rate={acc_rate:.6f}\n")
