@@ -1,0 +1,209 @@
+using Random
+using Statistics
+using DelimitedFiles
+using Base.Threads
+
+# ---------- target density pieces (work with Float32/Float64) ----------
+@inline @fastmath function unnormalized_t4_like_pdf(x)
+    inv(1 + x^4 / 4)
+end
+@inline @fastmath function log_unnormalized_t4_like_pdf(x)
+    -log1p(x^4 / 4)
+end
+@inline @fastmath function grad_log_unnormalized_t4_like_pdf(x)
+    -x / (2 * (1 + x^4 / 4))
+end
+
+# ---------- your CPU implementation (unchanged) ----------
+function mala_t4_like(n_iter::Int, initial::Float64, step_size::Float64,
+                      burnin::Int, rng::AbstractRNG)
+    chain = Vector{Float64}(undef, n_iter)
+    chain[1] = initial
+    log_p_current = log_unnormalized_t4_like_pdf(initial)
+    ergodic_sum_abs = 0.0
+    ergodic_sum_indicator = 0.0
+    ss2   = step_size^2
+    inv2s = 1.0 / (2 * ss2)
+    rand_vals = randn(rng, n_iter - 1)
+
+    @inbounds for i in 2:n_iter
+        x_curr = chain[i-1]
+        g_curr = grad_log_unnormalized_t4_like_pdf(x_curr)
+
+        mean_fwd = x_curr + (ss2 / 2) * g_curr
+        x_prop   = mean_fwd + step_size * rand_vals[i-2]
+
+        log_p_prop = log_unnormalized_t4_like_pdf(x_prop)
+        g_prop     = grad_log_unnormalized_t4_like_pdf(x_prop)
+        mean_bwd   = x_prop + (ss2 / 2) * g_prop
+
+        log_q_fwd = -inv2s * (x_prop - mean_fwd)^2
+        log_q_bwd = -inv2s * (x_curr - mean_bwd)^2
+
+        log_α = log_p_prop + log_q_bwd - (log_p_current + log_q_fwd)
+
+        if log(rand(rng)) < log_α
+            chain[i]      = x_prop
+            log_p_current = log_p_prop
+        else
+            chain[i] = x_curr
+        end
+
+        if i > burnin
+            abs_val = abs(chain[i])
+            ergodic_sum_abs      += abs_val
+            ergodic_sum_indicator += abs_val >= 2.0 ? 1.0 : 0.0
+        end
+    end
+    return chain, ergodic_sum_abs, ergodic_sum_indicator
+end
+
+function main_cpu()
+    println("Number of threads available: ", Threads.nthreads())
+    println("Number of CPU cores: ", Sys.CPU_THREADS)
+
+    N              = 10_000
+    burnin         = 100
+    n_simulations  = 11_000
+    step_size      = 0.55
+
+    erg_abs        = zeros(Float64, n_simulations)
+    erg_indicator  = zeros(Float64, n_simulations)
+    last5_chain1   = zeros(Float64, 5)
+    rngs = [MersenneTwister(rand(UInt32)) for _ in 1:nthreads()]
+
+    start_time = time()
+    Threads.@threads for i in 1:n_simulations
+        tid = Threads.threadid()
+        local_rng = rngs[tid]
+        chain, s_abs, s_ind = mala_t4_like(N, 0.0, step_size, burnin, local_rng)
+        erg_abs[i]       = s_abs / (N - burnin)
+        erg_indicator[i] = s_ind / (N - burnin)
+        if i == 1
+            last5_chain1 .= chain[end-4:end]
+        end
+    end
+    elapsed = time() - start_time
+
+    println("CPU elapsed time: $(round(elapsed, digits=2)) s")
+    println("Throughput: $(round(n_simulations / elapsed, digits=1)) chains/s")
+    println("\nLast 5 samples of first chain:"); println(last5_chain1)
+    println("Last 5 ergodic averages for |x|:"); println(erg_abs[end-4:end])
+    println("Last 5 ergodic averages for indicator (|x| ≥ 2):"); println(erg_indicator[end-4:end])
+
+    scriptdir = @__DIR__
+    writedlm(joinpath(scriptdir, "ergodic_average_abs_MALA.csv"), erg_abs, ',')
+    writedlm(joinpath(scriptdir, "ergodic_average_indicator_MALA.csv"), erg_indicator, ',')
+    println("\nCPU CSV files written.")
+end
+
+# ---------- AMD GPU version (ROCm via AMDGPU.jl) ----------
+function main_amd(; N::Int=10_000, burnin::Int=100, n_chains::Int=11_000, step_size::Float32=0.55f0)
+    import AMDGPU
+    if !AMDGPU.has_rocm()
+        println("ROCm/AMD GPU not available; falling back to CPU.")
+        return main_cpu()
+    end
+
+    # Disallow accidental slow scalar ops on device
+    AMDGPU.allowscalar(false)
+
+    ss2   = step_size^2
+    inv2s = 1f0 / (2f0 * ss2)
+
+    # Device arrays (start all chains at 0)
+    x     = AMDGPU.ROCArray(zeros(Float32, n_chains))
+    logp  = similar(x); @. logp = log_unnormalized_t4_like_pdf(x)
+    sum_abs = AMDGPU.ROCArray(zeros(Float32, n_chains))
+    sum_ind = AMDGPU.ROCArray(zeros(Float32, n_chains))
+
+    # RNG buffers
+    ξ = AMDGPU.ROCArray(zeros(Float32, n_chains))  # N(0,1)
+    u = AMDGPU.ROCArray(zeros(Float32, n_chains))  # U(0,1)
+
+    last5_chain1 = Vector{Float32}(undef, 5)
+
+    start_time = time()
+    @inbounds for t in 2:N
+        AMDGPU.randn!(ξ)
+        g_curr   = grad_log_unnormalized_t4_like_pdf.(x)
+        mean_fwd = @. x + (ss2/2f0) * g_curr
+        x_prop   = @. mean_fwd + step_size * ξ
+
+        logp_prop = log_unnormalized_t4_like_pdf.(x_prop)
+        g_prop    = grad_log_unnormalized_t4_like_pdf.(x_prop)
+        mean_bwd  = @. x_prop + (ss2/2f0) * g_prop
+
+        log_q_fwd = @. -inv2s * (x_prop - mean_fwd)^2
+        log_q_bwd = @. -inv2s * (x - mean_bwd)^2
+
+        logα = @. logp_prop + log_q_bwd - (logp + log_q_fwd)
+
+        AMDGPU.rand!(u)
+        accept = @. log(u) < logα  # ROCArray{Bool}
+
+        x    = ifelse.(accept, x_prop, x)
+        logp = ifelse.(accept, logp_prop, logp)
+
+        if t > burnin
+            ax = abs.(x)
+            sum_abs .+= ax
+            sum_ind .+= ax .>= 2f0
+        end
+    end
+    elapsed = time() - start_time
+
+    erg_abs_gpu = Array(sum_abs) ./ (N - burnin)
+    erg_ind_gpu = Array(sum_ind) ./ (N - burnin)
+
+    # Grab "last 5 samples of chain 1": lightweight side-run for 5 steps
+    begin
+        x1 = AMDGPU.ROCArray(zeros(Float32, 1)); x1 .= x[1]
+        lp1 = AMDGPU.ROCArray(zeros(Float32, 1)); lp1 .= logp[1]
+        buf = AMDGPU.ROCArray(zeros(Float32, 5))
+        ξ1 = AMDGPU.ROCArray(zeros(Float32, 1)); u1 = AMDGPU.ROCArray(zeros(Float32, 1))
+        for k in 1:5
+            AMDGPU.randn!(ξ1)
+            g = grad_log_unnormalized_t4_like_pdf.(x1)
+            mean_fwd = @. x1 + (ss2/2f0) * g
+            x_prop = @. mean_fwd + step_size * ξ1
+            lp_prop = log_unnormalized_t4_like_pdf.(x_prop)
+            gp = grad_log_unnormalized_t4_like_pdf.(x_prop)
+            mean_bwd = @. x_prop + (ss2/2f0) * gp
+            lq_fwd = @. -inv2s * (x_prop - mean_fwd)^2
+            lq_bwd = @. -inv2s * (x1 - mean_bwd)^2
+            lalpha = @. lp_prop + lq_bwd - (lp1 + lq_fwd)
+            AMDGPU.rand!(u1)
+            acc = @. log(u1) < lalpha
+            x1  = ifelse.(acc, x_prop, x1)
+            lp1 = ifelse.(acc, lp_prop, lp1)
+            buf[k] = x1[1]
+        end
+        copyto!(last5_chain1, Array(buf))
+    end
+
+    println("AMD GPU elapsed time: $(round(elapsed, digits=2)) s")
+    println("Throughput: $(round(n_chains / elapsed, digits=1)) chains/s")
+    println("\nLast 5 samples of first chain (GPU):"); println(last5_chain1)
+    println("Last 5 ergodic averages for |x|:"); println(erg_abs_gpu[end-4:end])
+    println("Last 5 ergodic averages for indicator (|x| ≥ 2):"); println(erg_ind_gpu[end-4:end])
+
+    scriptdir = @__DIR__
+    writedlm(joinpath(scriptdir, "ergodic_average_abs_MALA_AMD.csv"), erg_abs_gpu, ',')
+    writedlm(joinpath(scriptdir, "ergodic_average_indicator_MALA_AMD.csv"), erg_ind_gpu, ',')
+    println("\nAMD GPU CSV files written.")
+end
+
+# ---------- Entrypoint that prefers AMD GPU ----------
+function main()
+    try
+        @eval import AMDGPU
+        main_amd()
+    catch e
+        @warn "AMD GPU path failed or AMDGPU.jl not installed; using CPU. ($e)"
+        main_cpu()
+    end
+end
+
+# Run!
+main()
