@@ -16,12 +16,12 @@ import pyopencl.array as cl_array
 
 # ================== TUNABLES ==================
 DIM               =        20      # dimensionality (keep <= 64 with current kernel buffer)
-N_TOTAL           =  2_000_000     # steps per chain (>= 2)
-BURNIN            =    500_000
-N_CHAINS          =    200_000     # raise to 300k if VRAM allows (for higher utilization)
+N_TOTAL           =  20_000_000     # steps per chain (>= 2)
+BURNIN            =    9500_000
+N_CHAINS          =    120_000     # raise to 300k if VRAM allows (for higher utilization)
 
 # Target: Student-t per dimension
-NU_TARGET         =        5.0     # try 1.5, 2.0, 5.0, etc.
+NU_TARGET         =        1.0     # try 1.5, 2.0, 5.0, etc.
 TAU_TARGET        =        1.0
 
 # Proposal: symmetric double-Pareto (mirrored Lomax), i.i.d. across dims
