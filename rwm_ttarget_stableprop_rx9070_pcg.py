@@ -12,12 +12,12 @@ import pyopencl.array as cl_array
 # os.environ["PYOPENCL_NO_CACHE"] = "1"
 
 # ================== TUNABLES ==================
-N_TOTAL           =  2_000_000     # steps per chain
-BURNIN            =    500_000
-N_CHAINS          =     50_000     # raise to 100k–300k to feed the GPU
+N_TOTAL           =  5_0000_000     # steps per chain
+BURNIN            =    2_0000_000 
+N_CHAINS          =     150_000     # raise to 100k–300k to feed the GPU
 
 # Target: Student-t with nu_target > 3 (use 5) and scale tau
-NU_TARGET         =        5.0
+NU_TARGET         =        1.0
 TAU_TARGET        =        1.0
 
 # Proposal: symmetric alpha-stable via CMS
