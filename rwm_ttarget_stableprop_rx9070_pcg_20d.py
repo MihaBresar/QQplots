@@ -1,11 +1,15 @@
 # rwm_ttarget_dpareto_pcg_20d.py
 # 20-D RWM targeting independent Student-t per dimension.
-# Proposal: i.i.d. symmetric double-Pareto (mirrored Lomax) with tail exponent (1+alpha).
+# Proposal: i.i.d. symmetric double-Pareto (mirrored Lomax), tail exponent (1+alpha).
 # RNG: PCG32 per chain (64-bit state + 64-bit odd increment).
-# Correct MH: cache proposed vector once and reuse on accept (no re-sampling).
-# Indicator changed to |x| > 5. Writes CSVs and tracks chain-0 acceptance.
+# Correct MH: cache proposed vector once and reuse on accept.
+# Indicator: any(|x_j| > 5) per step.
+# Writes CSVs and tracks chain-0 acceptance.
 
-import os, time, csv, numpy as np
+import os
+import time
+import csv
+import numpy as np
 import pyopencl as cl
 import pyopencl.array as cl_array
 
@@ -52,7 +56,7 @@ inline float pcg_u01(u64 *state, u64 inc) {
     return fmax(((float)(x + 1u)) * 2.3283064365386963e-10f, 1.0e-7f);
 }
 
-// ===== Double-Pareto (mirrored Lomax) step =====
+// ===== Double-Pareto (mirrored Lomax) proposal =====
 // magnitude = scale * (U^(-1/alpha) - 1), sign = +/- with prob 1/2
 // Numerically safe: cap y = -(1/alpha)*log(u) to <= 80 to avoid overflow.
 inline float heavy_step_dp(u64 *state, u64 inc, float alpha, float scale){
@@ -307,27 +311,27 @@ def run():
     props = int(prop_count.get()[0])
     acc_rate = (acc / props) if props > 0 else float('nan')
 
-    print(f\"\nElapsed: {elapsed:.2f}s | Chains: {n:,} | Steps/chain: {N_TOTAL:,} | Dim: {D}\")
-    print(\"Last 5 ergodic mean |x| over dims:\", erg_abs[-5:])
-    print(\"Last 5 ergodic indicators any(|x|>5):\", erg_ind[-5:])
-    print(f\"Chain 0 acceptance: {acc} / {props} = {acc_rate:.4f}\")
+    print(f"\nElapsed: {elapsed:.2f}s | Chains: {n:,} | Steps/chain: {N_TOTAL:,} | Dim: {D}")
+    print("Last 5 ergodic mean |x| over dims:", erg_abs[-5:])
+    print("Last 5 ergodic indicators any(|x|>5):", erg_ind[-5:])
+    print(f"Chain 0 acceptance: {acc} / {props} = {acc_rate:.4f}")
 
     # Save CSVs next to this script
     scriptdir = os.path.dirname(os.path.abspath(__file__))
 
-    with open(os.path.join(scriptdir, \"ergodic_average_abs_RWM_20d_dpareto_pcg.csv\"), \"w\", newline=\"\") as f:
+    with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_20d_dpareto_pcg.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerows([[v] for v in erg_abs])
 
-    with open(os.path.join(scriptdir, \"ergodic_average_indicator_RWM_20d_dpareto_pcg.csv\"), \"w\", newline=\"\") as f:
+    with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_20d_dpareto_pcg.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerows([[v] for v in erg_ind])
 
-    with open(os.path.join(scriptdir, \"acceptance_chain0_RWM_20d_dpareto_pcg.txt\"), \"w\") as f:
-        f.write(f\"accepts={acc}, proposals={props}, accept_rate={acc_rate:.6f}\\n\")
+    with open(os.path.join(scriptdir, "acceptance_chain0_RWM_20d_dpareto_pcg.txt"), "w") as f:
+        f.write(f"accepts={acc}, proposals={props}, accept_rate={acc_rate:.6f}\n")
 
-    print(\"\\nCSV files written:\")
-    print(\"  ergodic_average_abs_RWM_20d_dpareto_pcg.csv\")
-    print(\"  ergodic_average_indicator_RWM_20d_dpareto_pcg.csv\")
-    print(\"  acceptance_chain0_RWM_20d_dpareto_pcg.txt\")
+    print("\nCSV files written:")
+    print("  ergodic_average_abs_RWM_20d_dpareto_pcg.csv")
+    print("  ergodic_average_indicator_RWM_20d_dpareto_pcg.csv")
+    print("  acceptance_chain0_RWM_20d_dpareto_pcg.txt")
 
-if __name__ == \"__main__\":
+if __name__ == "__main__":
     run()
