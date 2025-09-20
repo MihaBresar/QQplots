@@ -1,8 +1,9 @@
-# rwm_ttarget_dpareto_pcg_20d_gpu.py
+# rwm_ttarget_dpareto_pcg_20d_gpu_f32.py
 # 20-D RWM targeting independent Student-t per dimension.
 # Proposal: symmetric double-Pareto (mirrored Lomax), i.i.d. across dims.
 # RNG: PCG32 per chain (64-bit state + 64-bit odd increment).
-# Correct MH: cache proposed vector and reuse on accept (no re-sampling).
+# Correct MH: propose once, cache, reuse on accept.
+# Accumulators: float32 (no FP64 in hot loop) for better RX utilization.
 # Indicator: any(|x_j| > 5) per step.
 # CSV outputs and acceptance tracking for chain 0. ASCII-only kernel.
 
@@ -17,7 +18,7 @@ import pyopencl.array as cl_array
 DIM               =        20      # dimensionality (keep <= 64 with current kernel buffer)
 N_TOTAL           =  2_000_000     # steps per chain (>= 2)
 BURNIN            =    500_000
-N_CHAINS          =     50_000     # raise to 200k–300k to see higher GPU utilization
+N_CHAINS          =    200_000     # raise to 300k if VRAM allows (for higher utilization)
 
 # Target: Student-t per dimension
 NU_TARGET         =        5.0     # try 1.5, 2.0, 5.0, etc.
@@ -27,7 +28,7 @@ TAU_TARGET        =        1.0
 PROPOSAL_ALPHA    =        0.10    # heavier tails -> lower acceptance
 PROPOSAL_SCALE    =        1.0     # base scale; effective scale uses D^(-1/alpha)
 
-STEPS_PER_LAUNCH  =      3000      # inner-iter does 2 steps => 6000 steps/launch
+STEPS_PER_LAUNCH  =      8000      # inner-iter K does 2*K steps => 16k steps/launch
 DESIRED_LOCAL     =       256      # 128/256/512; auto-clamped
 SEED              = 123456789
 
@@ -115,8 +116,8 @@ inline float log_unnorm_t_target(float x, float nu, float tau){
 // Two RWM steps per inner loop; cache proposed vector once; reuse on accept.
 __kernel void rwm_dpareto_chunk2_pcg_20d(
     __global float  *x,                     // length n*D (structure-of-arrays per chain)
-    __global double *sum_abs,               // per-chain accumulator of mean |x|
-    __global double *sum_ind,               // per-chain accumulator of indicator any(|x|>thr)
+    __global float  *sum_abs,               // per-chain accumulator of mean |x|
+    __global float  *sum_ind,               // per-chain accumulator of indicator any(|x|>thr)
     __global int    *burn_left,             // per-chain burnin counter
     __global ulong  *rng_state_hi,          // per-chain PCG state (updated)
     __global ulong  *rng_inc_lo,            // per-chain PCG increment (constant, odd)
@@ -169,15 +170,15 @@ __kernel void rwm_dpareto_chunk2_pcg_20d(
         }
         if (i==0) prop0++;
         if (b > 0) --b; else {
-            double sum_abs_d = 0.0;
+            float sum_abs_d = 0.0f;
             int any_large = 0;
             for (int d=0; d<D; ++d){
                 float ax = fabs(x[base + d]);
-                sum_abs_d += (double)ax;
+                sum_abs_d += ax;
                 any_large |= (ax > thr) ? 1 : 0;
             }
-            sum_abs[i] += sum_abs_d / (double)D;
-            sum_ind[i] += (double)any_large;
+            sum_abs[i] += sum_abs_d / (float)D;
+            sum_ind[i] += (float)any_large;
         }
 
         // ----- step B -----
@@ -200,15 +201,15 @@ __kernel void rwm_dpareto_chunk2_pcg_20d(
         }
         if (i==0) prop0++;
         if (b > 0) --b; else {
-            double sum_abs_d = 0.0;
+            float sum_abs_d = 0.0f;
             int any_large = 0;
             for (int d=0; d<D; ++d){
                 float ax = fabs(x[base + d]);
-                sum_abs_d += (double)ax;
+                sum_abs_d += ax;
                 any_large |= (ax > thr) ? 1 : 0;
             }
-            sum_abs[i] += sum_abs_d / (double)D;
-            sum_ind[i] += (double)any_large;
+            sum_abs[i] += sum_abs_d / (float)D;
+            sum_ind[i] += (float)any_large;
         }
     }
 
@@ -289,8 +290,8 @@ def run():
 
     # Device buffers
     x = cl_array.zeros(queue, n*D, dtype=np.float32)            # start at 0
-    sum_abs = cl_array.zeros(queue, n, dtype=np.float64)        # mean |x| over dims
-    sum_ind = cl_array.zeros(queue, n, dtype=np.float64)        # indicator any(|x|>thr)
+    sum_abs = cl_array.zeros(queue, n, dtype=np.float32)        # mean |x| over dims
+    sum_ind = cl_array.zeros(queue, n, dtype=np.float32)        # indicator any(|x|>thr)
     burn_left = cl_array.to_device(queue, np.full(n, BURNIN, dtype=np.int32))
 
     # PCG32 RNG: per-chain state and increments
@@ -359,19 +360,19 @@ def run():
     # Save CSVs next to this script
     scriptdir = os.path.dirname(os.path.abspath(__file__))
 
-    with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_20d_dpareto_pcg.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerows([[v] for v in erg_abs])
+    with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_20d_dpareto_pcg_f32.csv"), "w", newline="") as f:
+        w = csv.writer(f); w.writerows([[float(v)] for v in erg_abs])
 
-    with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_20d_dpareto_pcg.csv"), "w", newline="") as f:
-        w = csv.writer(f); w.writerows([[v] for v in erg_ind])
+    with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_20d_dpareto_pcg_f32.csv"), "w", newline="") as f:
+        w = csv.writer(f); w.writerows([[float(v)] for v in erg_ind])
 
-    with open(os.path.join(scriptdir, "acceptance_chain0_RWM_20d_dpareto_pcg.txt"), "w") as f:
+    with open(os.path.join(scriptdir, "acceptance_chain0_RWM_20d_dpareto_pcg_f32.txt"), "w") as f:
         f.write(f"accepts={acc}, proposals={props}, accept_rate={acc_rate:.6f}\n")
 
     print("\nCSV files written:")
-    print("  ergodic_average_abs_RWM_20d_dpareto_pcg.csv")
-    print("  ergodic_average_indicator_RWM_20d_dpareto_pcg.csv")
-    print("  acceptance_chain0_RWM_20d_dpareto_pcg.txt")
+    print("  ergodic_average_abs_RWM_20d_dpareto_pcg_f32.csv")
+    print("  ergodic_average_indicator_RWM_20d_dpareto_pcg_f32.csv")
+    print("  acceptance_chain0_RWM_20d_dpareto_pcg_f32.txt")
 
 if __name__ == "__main__":
     run()
