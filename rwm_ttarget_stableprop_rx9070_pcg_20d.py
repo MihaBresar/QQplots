@@ -1,10 +1,10 @@
-# rwm_ttarget_dpareto_pcg_20d.py
+# rwm_ttarget_dpareto_pcg_20d_gpu.py
 # 20-D RWM targeting independent Student-t per dimension.
-# Proposal: i.i.d. symmetric double-Pareto (mirrored Lomax), tail exponent (1+alpha).
+# Proposal: symmetric double-Pareto (mirrored Lomax), i.i.d. across dims.
 # RNG: PCG32 per chain (64-bit state + 64-bit odd increment).
-# Correct MH: cache proposed vector once and reuse on accept.
+# Correct MH: cache proposed vector and reuse on accept (no re-sampling).
 # Indicator: any(|x_j| > 5) per step.
-# Writes CSVs and tracks chain-0 acceptance.
+# CSV outputs and acceptance tracking for chain 0. ASCII-only kernel.
 
 import os
 import time
@@ -14,28 +14,59 @@ import pyopencl as cl
 import pyopencl.array as cl_array
 
 # ================== TUNABLES ==================
-DIM               =        20      # dimensionality
-N_TOTAL           =  2_000_000     # steps per chain
+DIM               =        20      # dimensionality (keep <= 64 with current kernel buffer)
+N_TOTAL           =  2_000_000     # steps per chain (>= 2)
 BURNIN            =    500_000
-N_CHAINS          =     50_000     # raise to 100k–300k as needed
+N_CHAINS          =     50_000     # raise to 200k–300k to see higher GPU utilization
 
 # Target: Student-t per dimension
-NU_TARGET         =        5.0
+NU_TARGET         =        5.0     # try 1.5, 2.0, 5.0, etc.
 TAU_TARGET        =        1.0
 
 # Proposal: symmetric double-Pareto (mirrored Lomax), i.i.d. across dims
-PROPOSAL_ALPHA    =        0.10     # heavier tails -> lower acceptance
-PROPOSAL_SCALE    =        1.0      # base scale; effective scale uses D^(-1/alpha)
+PROPOSAL_ALPHA    =        0.10    # heavier tails -> lower acceptance
+PROPOSAL_SCALE    =        1.0     # base scale; effective scale uses D^(-1/alpha)
 
-STEPS_PER_LAUNCH  =      3000       # inner-iter does 2 steps => 6000 steps/launch
-DESIRED_LOCAL     =       256       # 128/256/512; auto-clamped
+STEPS_PER_LAUNCH  =      3000      # inner-iter does 2 steps => 6000 steps/launch
+DESIRED_LOCAL     =       256      # 128/256/512; auto-clamped
 SEED              = 123456789
 
-# Lock to RX 9070 based on your listing: Platform 0, Device 1
-PLATFORM_INDEX    =         0
-DEVICE_INDEX      =         1
+# ================== Robust AMD GPU picker ==================
+def pick_best_gpu(prefer_name_contains=("gfx1201", "Radeon RX", "RX 9", "7900")):
+    plats = cl.get_platforms()
+    best = None
+    best_score = -1
+    for p in plats:
+        try:
+            devs = p.get_devices(device_type=cl.device_type.GPU)
+        except cl.LogicError:
+            continue
+        for d in devs:
+            name = d.get_info(cl.device_info.NAME)
+            vendor = d.get_info(cl.device_info.VENDOR)
+            cu = d.get_info(cl.device_info.MAX_COMPUTE_UNITS)
+            mem = d.get_info(cl.device_info.GLOBAL_MEM_SIZE)
+            score = cu + (mem / float(8 << 30))  # weight mem in ~8 GiB units
+            if "Advanced Micro Devices" in vendor:
+                score += 100
+            if any(tag.lower() in name.lower() for tag in prefer_name_contains):
+                score += 50
+            if score > best_score:
+                best = d
+                best_score = score
+    if best is None:
+        # fallback: any GPU
+        for p in plats:
+            try:
+                devs = p.get_devices(device_type=cl.device_type.GPU)
+                if devs:
+                    return devs[0]
+            except cl.LogicError:
+                pass
+        raise RuntimeError("No OpenCL GPU device found.")
+    return best
 
-# ================== KERNEL (ASCII ONLY) ==================
+# ================== OpenCL KERNEL (ASCII ONLY) ==================
 KERNEL = r"""
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
@@ -53,6 +84,7 @@ inline u32 pcg32_next(u64 *state, u64 inc) {
 }
 inline float pcg_u01(u64 *state, u64 inc) {
     u32 x = pcg32_next(state, inc);
+    // (0,1]; avoid exact 0 to keep logs safe
     return fmax(((float)(x + 1u)) * 2.3283064365386963e-10f, 1.0e-7f);
 }
 
@@ -78,7 +110,7 @@ inline float log_unnorm_t_target(float x, float nu, float tau){
     return -0.5f * (nu + 1.0f) * native_log(q);
 }
 
-#define MAX_D 64  // enough room for DIM=20
+#define MAX_D 64  // enough room for DIM up to 64
 
 // Two RWM steps per inner loop; cache proposed vector once; reuse on accept.
 __kernel void rwm_dpareto_chunk2_pcg_20d(
@@ -86,8 +118,8 @@ __kernel void rwm_dpareto_chunk2_pcg_20d(
     __global double *sum_abs,               // per-chain accumulator of mean |x|
     __global double *sum_ind,               // per-chain accumulator of indicator any(|x|>thr)
     __global int    *burn_left,             // per-chain burnin counter
-    __global ulong  *rng_state_hi,          // per-chain PCG state
-    __global ulong  *rng_inc_lo,            // per-chain PCG increment (odd)
+    __global ulong  *rng_state_hi,          // per-chain PCG state (updated)
+    __global ulong  *rng_inc_lo,            // per-chain PCG increment (constant, odd)
     __global uint   *acc_count_out,         // chain 0 acceptance count
     __global uint   *prop_count_out,        // chain 0 proposal count
     const int n,
@@ -189,7 +221,7 @@ __kernel void rwm_dpareto_chunk2_pcg_20d(
 }
 """
 
-# ================== UTIL ==================
+# ================== Build helpers ==================
 def build_program(ctx):
     return cl.Program(ctx, KERNEL).build(options=[
         "-cl-fast-relaxed-math", "-cl-mad-enable", "-cl-no-signed-zeros"
@@ -235,11 +267,16 @@ def round_up(x, m):
 
 # ================== RUN ==================
 def run():
-    plats = cl.get_platforms()
-    dev = plats[PLATFORM_INDEX].get_devices()[DEVICE_INDEX]
+    # Pick the best AMD GPU (RX 9070 should be selected)
+    dev = pick_best_gpu()
     ctx = cl.Context([dev])
-    queue = cl.CommandQueue(ctx)
-    print("Using device:", dev.platform.name, "|", dev.name)
+    queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
+
+    name = dev.get_info(cl.device_info.NAME)
+    vendor = dev.get_info(cl.device_info.VENDOR)
+    cu = dev.get_info(cl.device_info.MAX_COMPUTE_UNITS)
+    gmem = dev.get_info(cl.device_info.GLOBAL_MEM_SIZE)
+    print("Using device:", vendor, "|", name, "| CUs:", cu, "| Mem GiB:", round(gmem/2**30,1))
 
     prg = build_program(ctx)
     kernel = cl.Kernel(prg, "rwm_dpareto_chunk2_pcg_20d")
@@ -247,7 +284,7 @@ def run():
     n = int(N_CHAINS)
     D = int(DIM)
 
-    # Effective per-dimension scale: D^{-1/alpha}
+    # Effective per-dimension scale: D^{-1/alpha} to keep typical jump roughly dim-invariant
     eff_scale = PROPOSAL_SCALE * (D ** (-1.0 / PROPOSAL_ALPHA))
 
     # Device buffers
@@ -280,15 +317,17 @@ def run():
     kernel.set_arg(12, np.float32(NU_TARGET))
     kernel.set_arg(13, np.float32(TAU_TARGET))
     kernel.set_arg(14, np.float32(5.0))     # indicator threshold |x| > 5
-    # arg 15 = K set per launch
+    # arg 15 = K set per launch below
 
     # Launch geometry
     local_size = choose_local_size(dev, kernel, DESIRED_LOCAL)
     gsize = round_up(n, local_size)
     global_size = (gsize,)
     local_size  = (local_size,)
+    print("Global size:", global_size, " Local size:", local_size,
+          "| Chains:", n, " Dim:", D, " Steps/launch (effective):", 2*STEPS_PER_LAUNCH)
 
-    # Warmup (2 steps)
+    # Warmup (2 steps total)
     kernel.set_arg(15, np.int32(1))
     cl.enqueue_nd_range_kernel(queue, kernel, global_size, local_size).wait()
 
@@ -303,6 +342,7 @@ def run():
 
     elapsed = time.time() - t0
 
+    # Collect results
     kept = max(0, (N_TOTAL - 1) - BURNIN)
     erg_abs = (sum_abs.get()/max(kept,1))
     erg_ind = (sum_ind.get()/max(kept,1))
