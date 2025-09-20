@@ -1,8 +1,10 @@
-# rwm_ttarget_stableprop_rx9070_pcg_20d.py
-# 20-D Random-Walk Metropolis targeting independent Student-t per dimension.
-# Proposal: i.i.d. symmetric alpha-stable (alpha=0.1) via CMS, per dimension.
-# RNG: PCG32 with independent per-chain streams (64-bit state + 64-bit odd increment).
-# OpenCL on AMD RX 9070 (gfx1201). ASCII-only; CSV outputs and chain-0 acceptance.
+# rwm_ttarget_stableprop_rx9070_pcg_20d_fix.py
+# 20-D RWM targeting independent Student-t per dimension.
+# Proposal: i.i.d. symmetric alpha-stable (alpha=0.1) via CMS (per-dim),
+# with dimension-aware scaling: eff_scale = PROPOSAL_SCALE * D^(-1/alpha).
+# RNG: PCG32 per chain (64-bit state + 64-bit odd increment).
+# Correct MH: cache proposed vector once and reuse on accept (no re-sampling).
+# Writes CSVs; tracks chain-0 acceptance.
 
 import os, time, csv, numpy as np
 import pyopencl as cl
@@ -12,15 +14,15 @@ import pyopencl.array as cl_array
 DIM               =        20      # dimensionality
 N_TOTAL           =  2_000_000     # steps per chain
 BURNIN            =    500_000
-N_CHAINS          =     50_000     # raise to 100k–300k to feed the GPU
+N_CHAINS          =     50_000     # raise to 100k–300k as needed
 
-# Target: Student-t per dimension with nu_target > 0 (nu > 3 => first 3 moments finite)
+# Target: Student-t per dimension
 NU_TARGET         =        5.0
 TAU_TARGET        =        1.0
 
 # Proposal: symmetric alpha-stable via CMS (i.i.d. across dims)
-PROPOSAL_ALPHA    =        0.10     # ultra heavy-tailed; tune for acceptance
-PROPOSAL_SCALE    =        0.75     # per-dimension step scale; tune to get 10–40% acceptance
+PROPOSAL_ALPHA    =        0.10     # tune 0.1 .. 0.5; heavier -> lower acceptance
+PROPOSAL_SCALE    =        1.0      # base scale; effective scale uses D^(-1/alpha)
 
 STEPS_PER_LAUNCH  =      3000       # inner-iter does 2 steps => 6000 steps/launch
 DESIRED_LOCAL     =       256       # 128/256/512; auto-clamped
@@ -78,29 +80,11 @@ inline float log_unnorm_t_target(float x, float nu, float tau){
     return -0.5f * (nu + 1.0f) * native_log(q);
 }
 
-// x is laid out as structure-of-arrays per chain: [x0,...,x{D-1}] for chain i, then chain i+1, etc.
-// We compute: total log p, mean_abs over dims, and any_large = any(|x_j| >= thr)
-inline void stats_for_vec(__global const float *x, int base, int D, float nu, float tau,
-                          float thr, float *lp_out, float *mean_abs_out, int *any_large_out)
-{
-    float lp = 0.0f;
-    float sum_abs = 0.0f;
-    int any_large = 0;
-    for (int d=0; d<D; ++d){
-        float xd = x[base + d];
-        lp += log_unnorm_t_target(xd, nu, tau);
-        float ax = fabs(xd);
-        sum_abs += ax;
-        any_large |= (ax >= thr) ? 1 : 0;
-    }
-    *lp_out = lp;
-    *mean_abs_out = sum_abs / (float)D;
-    *any_large_out = any_large;
-}
+#define MAX_D 64  // enough room for DIM=20
 
-// Two RWM steps per inner loop, 20-D (generic D)
-__kernel void rwm_stable_chunk2_pcg_20d(
-    __global float  *x,                     // length n*D
+// Two RWM steps per inner loop, cache proposed vector once, reuse on accept.
+__kernel void rwm_stable_chunk2_pcg_20d_fix(
+    __global float  *x,                     // length n*D (Structure-of-Arrays per chain)
     __global double *sum_abs,               // per-chain accumulator of mean |x|
     __global double *sum_ind,               // per-chain accumulator of indicator any(|x|>=thr)
     __global int    *burn_left,             // per-chain burnin counter
@@ -110,19 +94,19 @@ __kernel void rwm_stable_chunk2_pcg_20d(
     __global uint   *prop_count_out,        // chain 0 proposal count
     const int n,
     const int D,
-    const float alpha, const float prop_scale,
+    const float alpha, const float prop_scale_eff,   // effective scale already D^{-1/alpha}
     const float nu_target, const float tau_target,
     const float thr,                        // threshold for indicator (e.g., 2.0)
     const int K)
 {
     int i = get_global_id(0);
     if (i >= n) return;
+    if (D > MAX_D) return; // safety
 
-    int base = i * D;
-
-    int  b   = burn_left[i];
-    u64  st  = rng_state_hi[i];
-    u64  inc = rng_inc_lo[i];
+    int  base = i * D;
+    int  b    = burn_left[i];
+    u64  st   = rng_state_hi[i];
+    u64  inc  = rng_inc_lo[i];
 
     // current log target
     float lp_current = 0.0f;
@@ -131,29 +115,24 @@ __kernel void rwm_stable_chunk2_pcg_20d(
     }
 
     uint acc0 = 0, prop0 = 0; // chain 0 counters
+    __private float prop_buf[MAX_D]; // proposed vector cache
 
     for (int it=0; it<K; ++it){
-        // ----- step A -----
-        // propose vector
+        // ----- step A: propose once, cache, compute lp_prop -----
         float lp_prop = 0.0f;
-        // we keep proposed coords in registers and only write on accept
-        float xprop0; // we will re-use register via per-dim loop
-        // accumulate lp_prop
         for (int d=0; d<D; ++d){
-            float step = prop_scale * sample_symmetric_stable(&st, inc, alpha);
+            float step = prop_scale_eff * sample_symmetric_stable(&st, inc, alpha);
             float xprop = x[base + d] + step;
-            // temporarily re-use xprop0 variable to quiet some compilers
-            xprop0 = xprop; // not stored yet
-            lp_prop += log_unnorm_t_target(xprop0, nu_target, tau_target);
+            prop_buf[d] = xprop;
+            lp_prop += log_unnorm_t_target(xprop, nu_target, tau_target);
         }
-        // Metropolis accept
+        // MH accept
         float u = pcg_u01(&st, inc);
         if (native_log(u) < (lp_prop - lp_current)){
-            // accept: recompute and store xprop, lp_current
+            // accept: write cached proposal and update lp_current
             lp_current = 0.0f;
             for (int d=0; d<D; ++d){
-                float step = prop_scale * sample_symmetric_stable(&st, inc, alpha);
-                float xnew = x[base + d] + step;
+                float xnew = prop_buf[d];
                 x[base + d] = xnew;
                 lp_current += log_unnorm_t_target(xnew, nu_target, tau_target);
             }
@@ -161,28 +140,31 @@ __kernel void rwm_stable_chunk2_pcg_20d(
         }
         if (i==0) prop0++;
         if (b > 0) --b; else {
-            // accumulate diagnostics
-            float lp_dummy, mean_abs;
-            int any_large;
-            stats_for_vec(x, base, D, nu_target, tau_target, thr, &lp_dummy, &mean_abs, &any_large);
-            sum_abs[i] += (double)mean_abs;
+            // accumulate diagnostics from current state
+            double sum_abs_d = 0.0;
+            int any_large = 0;
+            for (int d=0; d<D; ++d){
+                float ax = fabs(x[base + d]);
+                sum_abs_d += (double)ax;
+                any_large |= (ax >= thr) ? 1 : 0;
+            }
+            sum_abs[i] += sum_abs_d / (double)D;
             sum_ind[i] += (double)any_large;
         }
 
-        // ----- step B -----
+        // ----- step B: same pattern -----
         lp_prop = 0.0f;
         for (int d=0; d<D; ++d){
-            float step = prop_scale * sample_symmetric_stable(&st, inc, alpha);
+            float step = prop_scale_eff * sample_symmetric_stable(&st, inc, alpha);
             float xprop = x[base + d] + step;
-            xprop0 = xprop;
-            lp_prop += log_unnorm_t_target(xprop0, nu_target, tau_target);
+            prop_buf[d] = xprop;
+            lp_prop += log_unnorm_t_target(xprop, nu_target, tau_target);
         }
         u = pcg_u01(&st, inc);
         if (native_log(u) < (lp_prop - lp_current)){
             lp_current = 0.0f;
             for (int d=0; d<D; ++d){
-                float step = prop_scale * sample_symmetric_stable(&st, inc, alpha);
-                float xnew = x[base + d] + step;
+                float xnew = prop_buf[d];
                 x[base + d] = xnew;
                 lp_current += log_unnorm_t_target(xnew, nu_target, tau_target);
             }
@@ -190,10 +172,14 @@ __kernel void rwm_stable_chunk2_pcg_20d(
         }
         if (i==0) prop0++;
         if (b > 0) --b; else {
-            float lp_dummy, mean_abs;
-            int any_large;
-            stats_for_vec(x, base, D, nu_target, tau_target, thr, &lp_dummy, &mean_abs, &any_large);
-            sum_abs[i] += (double)mean_abs;
+            double sum_abs_d = 0.0;
+            int any_large = 0;
+            for (int d=0; d<D; ++d){
+                float ax = fabs(x[base + d]);
+                sum_abs_d += (double)ax;
+                any_large |= (ax >= thr) ? 1 : 0;
+            }
+            sum_abs[i] += sum_abs_d / (double)D;
             sum_ind[i] += (double)any_large;
         }
     }
@@ -260,13 +246,15 @@ def run():
     print("Using device:", dev.platform.name, "|", dev.name)
 
     prg = build_program(ctx)
-    kernel = cl.Kernel(prg, "rwm_stable_chunk2_pcg_20d")
+    kernel = cl.Kernel(prg, "rwm_stable_chunk2_pcg_20d_fix")
 
     n = int(N_CHAINS)
     D = int(DIM)
 
+    # Effective per-dimension scale: D^{-1/alpha}
+    eff_scale = PROPOSAL_SCALE * (D ** (-1.0 / PROPOSAL_ALPHA))
+
     # Device buffers
-    # x: flatten [n, D]
     x = cl_array.zeros(queue, n*D, dtype=np.float32)            # start at 0
     sum_abs = cl_array.zeros(queue, n, dtype=np.float64)        # mean |x| over dims
     sum_ind = cl_array.zeros(queue, n, dtype=np.float64)        # indicator any(|x|>=thr)
@@ -292,7 +280,7 @@ def run():
     kernel.set_arg(8,  np.int32(n))
     kernel.set_arg(9,  np.int32(D))
     kernel.set_arg(10, np.float32(PROPOSAL_ALPHA))
-    kernel.set_arg(11, np.float32(PROPOSAL_SCALE))
+    kernel.set_arg(11, np.float32(eff_scale))
     kernel.set_arg(12, np.float32(NU_TARGET))
     kernel.set_arg(13, np.float32(TAU_TARGET))
     kernel.set_arg(14, np.float32(2.0))       # threshold for indicator |x|>=2
@@ -335,19 +323,19 @@ def run():
     # Save CSVs next to this script
     scriptdir = os.path.dirname(os.path.abspath(__file__))
 
-    with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_20d_pcg.csv"), "w", newline="") as f:
+    with open(os.path.join(scriptdir, "ergodic_average_abs_RWM_20d_pcg_fix.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerows([[v] for v in erg_abs])
 
-    with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_20d_pcg.csv"), "w", newline="") as f:
+    with open(os.path.join(scriptdir, "ergodic_average_indicator_RWM_20d_pcg_fix.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerows([[v] for v in erg_ind])
 
-    with open(os.path.join(scriptdir, "acceptance_chain0_RWM_20d_pcg.txt"), "w") as f:
+    with open(os.path.join(scriptdir, "acceptance_chain0_RWM_20d_pcg_fix.txt"), "w") as f:
         f.write(f"accepts={acc}, proposals={props}, accept_rate={acc_rate:.6f}\n")
 
     print("\nCSV files written:")
-    print("  ergodic_average_abs_RWM_20d_pcg.csv")
-    print("  ergodic_average_indicator_RWM_20d_pcg.csv")
-    print("  acceptance_chain0_RWM_20d_pcg.txt")
+    print("  ergodic_average_abs_RWM_20d_pcg_fix.csv")
+    print("  ergodic_average_indicator_RWM_20d_pcg_fix.csv")
+    print("  acceptance_chain0_RWM_20d_pcg_fix.txt")
 
 if __name__ == "__main__":
     run()
